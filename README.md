@@ -2,7 +2,7 @@
 
 ![Python](https://img.shields.io/badge/Python-3.10+-3776AB?style=flat&logo=python&logoColor=white)
 ![Bash](https://img.shields.io/badge/Bash-4.0+-4EAA25?style=flat&logo=gnubash&logoColor=white)
-![systemd](https://img.shields.io/badge/systemd-user%20service-555555?style=flat&logo=systemd&logoColor=white)
+![systemd](https://img.shields.io/badge/systemd-user_service-555555?style=flat&logo=systemd&logoColor=white)
 ![SSH](https://img.shields.io/badge/SSH-OpenSSH-231F20?style=flat)
 ![GNOME](https://img.shields.io/badge/GNOME-AppIndicator-4a86cf?style=flat&logo=gnome&logoColor=white)
 ![Linux](https://img.shields.io/badge/OS-Linux-FCC624?style=flat&logo=linux&logoColor=black)
