@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# ProxyCommand pintar untuk tunnel kantor.
+# Jalur lurus dipakai kalau port target bisa dijangkau langsung.
+# Kalau tidak (misal IP kita kena ban sementara di VPS target),
+# otomatis lompat lewat VPS perantara.
+set -u
+
+CONF="${KANTOR_CONF:-$HOME/.config/kantortun.conf}"
+[ -r "$CONF" ] && . "$CONF"
+
+HOP="${HOP:-}"
+HOP_KEY="${HOP_KEY:-$HOME/.ssh/id_ed25519}"
+
+h="${1:-}"; p="${2:-22}"
+[ -n "$h" ] || { echo "kantortun-route: host kosong" >&2; exit 1; }
+
+if [[ "$HOP" == "off" || -z "$HOP" ]]; then
+  exec /usr/bin/nc "$h" "$p"
+fi
+
+if timeout 5 bash -c "cat </dev/null >/dev/tcp/$h/$p" 2>/dev/null; then
+  exec /usr/bin/nc "$h" "$p"
+fi
+
+echo "kantortun-route: $h:$p tidak terjangkau langsung, lompat lewat $HOP" >&2
+exec /usr/bin/ssh -W "$h:$p" -i "$HOP_KEY" \
+  -o BatchMode=yes -o StrictHostKeyChecking=no -o ConnectTimeout=10 \
+  -o IdentitiesOnly=yes -o PreferredAuthentications=publickey \
+  "$HOP"

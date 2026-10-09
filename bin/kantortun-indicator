@@ -1,0 +1,578 @@
+#!/usr/bin/env python3
+# Indikator top bar untuk tunnel kantor. Teks antarmuka pakai bahasa Inggris.
+#
+# Alasan keputusan:
+# - Tray dipakai, bukan ekstensi GNOME, karena GNOME 46 di Wayland tidak memuat
+#   ekstensi baru tanpa login ulang. Tray lewat AppIndicator langsung muncul.
+# - Pembagian tugasnya: indikator ini SELALU hidup, tunnelnya default MATI.
+#   Indikator diawasi unit kantortun-indicator.service (Restart=always) dan
+#   dipicu dari autostart sesi, jadi ikonnya tidak bisa hilang diam-diam. Tunnel
+#   cuma jalan kalau user menekan tombolnya, jadi tidak ada trafik yang
+#   dibungkus tanpa diminta.
+# - Pola UX mengikuti klien Cloudflare WARP, acuan yang disebut user sendiri:
+#   satu baris aksi di paling atas, lalu setelan, lalu aksi, lalu Quit. Yang
+#   diambil kejelasannya, bukan tampilannya.
+# - Semua teks yang dibaca user bahasa Inggris, seragam dengan menu tray lain di
+#   desktop. Komentar file tetap Indonesia seperti script kantortun lainnya.
+# - Ikonnya motif tunnel sendiri (dua mulut pipa + garis tembus + titik paket),
+#   bukan glyph stok network-vpn: alatnya ssh -D, bukan VPN, jadi lambang lock
+#   plus plug menyesatkan. Bentuk on dan off beda (garis tembus putus vs utuh),
+#   jadi tetap terbaca saat ikon dirender monokrom.
+# - Tidak ada animasi. Indikator status cuma perlu menjawab nyala atau tidak.
+# - Baris toggle memuat nama VPS tujuan, jadi satu baris sudah menjawab "nyala
+#   lewat mana". Nama profil dipakai, bukan IP, karena lebih enak dibaca; IP
+#   lengkapnya ada di tooltip ikon dan di submenu Exit server.
+# - Tooltip ikon (set_title) memuat exit IP hasil curl nyata lewat SOCKS, bukan
+#   tebakan, supaya pertanyaan "aku keluar lewat IP apa" tidak perlu buka
+#   terminal. Kalau curl gagal, bagian itu dibuang, bukan diisi placeholder.
+# - Tidak ada baris status terpisah. Di tema GTK, baris insensitive dirender abu
+#   abu dan gagal kontras teks normal, sedangkan baris aktif yang tidak melakukan
+#   apa-apa termasuk kontrol mati. Status karena itu ditaruh di label toggle,
+#   bentuk ikon, dan tooltip ikon.
+# - Empat state: off, starting, on, failed. starting cuma muncul selama masa
+#   tunggu setelah tombol dinyalakan; failed menempel sampai user mencoba lagi,
+#   jangan jatuh balik ke tampilan "mati" begitu saja, nanti pesan gagalnya tidak
+#   pernah terbaca. failed punya dua sebab, start gagal dan tunnel yang tadinya
+#   hidup lalu putus, dan tooltip yang membedakan karena langkah lanjutnya beda.
+# - Tunnel putus ditangani hati-hati: unit tunnel punya Restart=always, jadi 5
+#   detik pertama kemungkinan besar cuma blip. Proxy sistem baru dilepas setelah
+#   DROP_PROXY_TICKS kali poll tetap mati, supaya browsing tidak kena reset bolak
+#   balik. Kalau ternyata hidup lagi, user dapat notifikasi "back".
+# - Baris Open tunnel log hanya muncul saat failed, jadi kegagalan selalu punya
+#   langkah lanjut.
+# - Notifikasi dipakai untuk hal yang tidak kelihatan lagi setelah menu ditutup:
+#   tunnel nyala, putus, nyambung lagi, gagal nyala, hasil uji, dan alamat yang
+#   disalin.
+# - Item aksi yang butuh tunnel hidup (Test, Restart) dibuat insensitive saat
+#   tunnel mati, bukan dibiarkan bisa diklik lalu membalas "belum jalan".
+# - "Start tunnel at login" mengubah enable/disable unit tunnel lewat CLI
+#   kantortun, bukan lewat systemctl sendiri: satu tempat yang tahu urusan
+#   autostart, dan hasilnya langsung terbaca di `kantortun status`.
+# - Baris "System proxy" juga memanggil CLI (kantortun proxy-on / system-off),
+#   bukan gsettings langsung: daftar ignore-hosts cuma ada di satu tempat, dan
+#   versi CLI-nya sudah memuat rentang privat + tailnet. Kalau disetel ulang di
+#   sini, Chrome ikut mengirim docker dan LAN kantor ke SOCKS di VPS, lalu app
+#   dev lokal jadi tidak bisa dibuka.
+# - Quit menghentikan unit indikatornya, bukan sekadar Gtk.main_quit(): unitnya
+#   Restart=always, jadi keluar dari GTK saja akan langsung dihidupkan systemd.
+#
+# Typelib Ayatana tidak terpasang di sistem ini, salinannya ada di
+# ~/.local/lib/girepository-1.0. Kalau nanti paket gir1.2-ayatanaappindicator3-0.1
+# dipasang lewat apt, folder itu tetap aman karena isinya cuma satu typelib.
+
+import os
+import re
+import socket
+import subprocess
+import sys
+
+EXTRA_TYPELIB = os.path.expanduser('~/.local/lib/girepository-1.0')
+if os.path.isdir(EXTRA_TYPELIB):
+    current = os.environ.get('GI_TYPELIB_PATH', '')
+    os.environ['GI_TYPELIB_PATH'] = EXTRA_TYPELIB + (':' + current if current else '')
+
+import gi
+
+gi.require_version('Gtk', '3.0')
+gi.require_version('Gdk', '3.0')
+gi.require_version('AyatanaAppIndicator3', '0.1')
+
+from gi.repository import AyatanaAppIndicator3 as AppIndicator
+from gi.repository import Gdk, Gio, GLib, Gtk
+
+UNIT = 'kantortun'
+INDICATOR_UNIT = 'kantortun-indicator'
+SYSTEMCTL = '/usr/bin/systemctl'
+CURL = '/usr/bin/curl'
+NOTIFY = '/usr/bin/notify-send'
+
+PROXY_ADDR = '127.0.0.1'
+PROXY_PORT = 1080
+PROXY_URL = 'socks5h://127.0.0.1:1080'
+
+ICON_DIR = os.path.expanduser('~/.local/share/kantortun')
+ICON_ON = 'kantortun-on-symbolic'
+ICON_OFF = 'kantortun-off-symbolic'
+
+POLL_SECONDS = 5
+START_GRACE_SECONDS = 12
+SWITCH_GRACE_SECONDS = 25
+DROP_PROXY_TICKS = 3          # 3 poll x 5 detik sebelum proxy sistem dilepas
+TEST_URL = 'https://www.youtube.com/'
+IP_URL = 'https://ipinfo.io/ip'
+IP_RE = re.compile(r'^[0-9a-fA-F:.]{7,45}$')
+LOG_PATH = '/tmp/kantortun.log'
+CONF_PATH = os.path.expanduser('~/.config/kantortun.conf')
+HOSTS_PATH = os.path.expanduser('~/.config/kantortun.hosts')
+KANTOR_BIN = os.path.expanduser('~/.local/bin/kantortun')
+
+
+def conf_value(key):
+    try:
+        with open(CONF_PATH, 'r', encoding='utf-8') as handle:
+            for line in handle:
+                line = line.strip()
+                if line.startswith(key + '='):
+                    return line.split('=', 1)[1].strip() or None
+    except OSError:
+        pass
+    return None
+
+
+def vps_host():
+    return conf_value('VPS_HOST')
+
+
+def vps_profile():
+    return conf_value('VPS_NAME')
+
+
+def host_list():
+    """Daftar VPS tujuan dari ~/.config/kantortun.hosts: (nama, user, host)."""
+    rows = []
+    try:
+        with open(HOSTS_PATH, 'r', encoding='utf-8') as handle:
+            for line in handle:
+                line = line.strip()
+                if not line or line.startswith('#'):
+                    continue
+                parts = [p.strip() for p in line.split('|')]
+                if len(parts) >= 3 and parts[0] and parts[2]:
+                    rows.append((parts[0], parts[1], parts[2]))
+    except OSError:
+        pass
+    return rows
+
+
+def autostart_enabled():
+    """True/False/None. None = systemctl tidak bisa menjawab, jangan sentuh UI."""
+    try:
+        result = subprocess.run([SYSTEMCTL, '--user', 'is-enabled', UNIT],
+                                capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    state = (result.stdout or '').strip()
+    if state in ('enabled', 'enabled-runtime', 'alias'):
+        return True
+    if state in ('disabled', 'masked', 'static'):
+        return False
+    return None
+
+
+def notify(message):
+    subprocess.Popen([NOTIFY, 'Kantortun', message])
+
+
+def port_open():
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(0.6)
+    try:
+        sock.connect((PROXY_ADDR, PROXY_PORT))
+        return True
+    except OSError:
+        return False
+    finally:
+        sock.close()
+
+
+class Kantortun:
+    def __init__(self):
+        self.state = 'off'
+        self.grace_until = 0
+        self.failed = False
+        self.failed_reason = ''            # 'start' atau 'drop', dipakai tooltip
+        self.down_ticks = 0                # poll berturut-turut dengan port tertutup
+        self.dropped_notified = False
+        self.exit_ip = None
+        self.exit_ip_pending = False
+        self.host = vps_host()
+        self.profile = vps_profile()
+        self.user_started = False          # true kalau start/switch datang dari klik
+        self.proxy_syncing = False         # guard waktu set_active dari settings
+        self.autostart_syncing = False     # guard waktu set_active dari systemctl
+        self.last_switch = (None, 0)       # debounce activate + toggled di baris radio
+
+        self.proxy_settings = Gio.Settings(schema_id='org.gnome.system.proxy')
+        self.proxy_settings.connect('changed::mode', lambda *_: self.render_proxy())
+
+        self.indicator = AppIndicator.Indicator.new(
+            'kantortun', ICON_OFF, AppIndicator.IndicatorCategory.APPLICATION_STATUS)
+        self.indicator.set_icon_theme_path(ICON_DIR)
+        self.indicator.set_status(AppIndicator.IndicatorStatus.ACTIVE)
+
+        self.menu = Gtk.Menu()
+
+        self.toggle_item = Gtk.MenuItem()
+        self.toggle_label = Gtk.Label(label='', xalign=0)
+        self.toggle_item.add(self.toggle_label)
+        self.toggle_item.connect('activate', self.on_toggle)
+        self.menu.append(self.toggle_item)
+
+        # checkbox, bukan baris teks status: satu klik mengubah keadaan dan
+        # tanda centang langsung menunjukkan keadaan sekarang.
+        self.proxy_item = Gtk.CheckMenuItem(label='System proxy')
+        self.proxy_item.connect('toggled', self.on_proxy_toggled)
+        self.menu.append(self.proxy_item)
+
+        # default tunnel yang diubah dari sini, bukan lewat terminal.
+        self.autostart_item = Gtk.CheckMenuItem(label='Start tunnel at login')
+        self.autostart_item.connect('toggled', self.on_autostart_toggled)
+        self.menu.append(self.autostart_item)
+
+        # dibuat lebih awal supaya widget-nya sudah ada sebelum submenu Exit server
+        # dibentuk di bawah; penempelan ke menu tetap dilakukan belakangan supaya
+        # urutannya tetap di atas baris Quit.
+        self.log_item = Gtk.MenuItem()
+        self.log_item.add(Gtk.Label(label='Open tunnel log', xalign=0))
+        self.log_item.connect('activate', self.on_open_log)
+        self.log_item.set_no_show_all(True)
+
+        # pilih VPS tujuan langsung dari tray. set_active dipanggil SEBELUM connect,
+        # karena radio item ikut memancarkan "activate" saat diaktifkan dari kode,
+        # dan itu bisa memicu ganti VPS sendiri waktu indikator baru dinyalakan.
+        self.selector_item = None
+        self.host_items = {}
+        rows = host_list()
+        if len(rows) > 1:
+            self.selector_item = Gtk.MenuItem()
+            self.selector_item.add(Gtk.Label(label='Exit server', xalign=0))
+            submenu = Gtk.Menu()
+            group = None
+            active = vps_profile()
+            for nama, _user, host in rows:
+                item = Gtk.RadioMenuItem(label=f'{nama} ({host})', group=group)
+                if group is None:
+                    group = item
+                if nama == active:
+                    item.set_active(True)
+                # dua-duanya dipasang: sebagian tray host cuma memancarkan salah
+                # satu signal untuk baris radio, dan waktu itu ganti VPS tidak
+                # jalan padahal radio-nya kelihatan pindah.
+                item.connect('activate', self.on_switch_host, nama)
+                item.connect('toggled', self.on_switch_host, nama)
+                submenu.append(item)
+                self.host_items[nama] = item
+            self.selector_item.set_submenu(submenu)
+            self.menu.append(self.selector_item)
+
+        self.menu.append(Gtk.SeparatorMenuItem())
+
+        self.test_item = Gtk.MenuItem()
+        self.test_item.add(Gtk.Label(label='Test tunnel', xalign=0))
+        self.test_item.connect('activate', self.on_test)
+        self.menu.append(self.test_item)
+
+        self.restart_item = Gtk.MenuItem()
+        self.restart_item.add(Gtk.Label(label='Restart tunnel', xalign=0))
+        self.restart_item.connect('activate', self.on_restart)
+        self.menu.append(self.restart_item)
+
+        self.copy_item = Gtk.MenuItem()
+        self.copy_item.add(Gtk.Label(label='Copy proxy address', xalign=0))
+        self.copy_item.connect('activate', self.on_copy)
+        self.menu.append(self.copy_item)
+
+        self.menu.append(self.log_item)
+
+        self.menu.append(Gtk.SeparatorMenuItem())
+
+        quit_item = Gtk.MenuItem()
+        quit_item.add(Gtk.Label(label='Quit kantortun', xalign=0))
+        quit_item.connect('activate', self.on_quit)
+        self.menu.append(quit_item)
+
+        self.menu.show_all()
+        self.log_item.set_visible(False)
+        self.indicator.set_menu(self.menu)
+
+        self.poll()
+        GLib.timeout_add_seconds(POLL_SECONDS, self.poll)
+        self.render_proxy()
+
+    def via(self):
+        # nama profil lebih enak dibaca daripada IP; kalau tidak ada, pakai host.
+        return self.profile or self.host or 'unknown'
+
+    def poll(self):
+        # nama VPS bisa berubah dari terminal atau dari menu, jadi dibaca ulang
+        self.host = vps_host()
+        self.profile = vps_profile()
+        self.refresh_autostart()
+
+        if port_open():
+            self.down_ticks = 0
+            if self.state != 'on':
+                if self.user_started:
+                    notify(f'Tunnel is up, via {self.via()}')
+                elif self.dropped_notified:
+                    notify(f'Tunnel is back, via {self.via()}')
+            self.grace_until = 0
+            self.failed = False
+            self.failed_reason = ''
+            self.user_started = False
+            self.dropped_notified = False
+            self.render('on')
+            if not self.exit_ip and not self.exit_ip_pending:
+                self.fetch_exit_ip()
+            return True
+
+        if self.grace_until and GLib.get_monotonic_time() < self.grace_until:
+            self.render('starting')
+            return True
+
+        if self.grace_until:
+            self.grace_until = 0
+            self.failed = True
+            self.failed_reason = 'start'
+            self.exit_ip = None
+            if self.clear_proxy_if_ours():
+                notify('Tunnel failed to start. System proxy turned off.')
+            else:
+                notify('Tunnel failed to start. Open the log for details.')
+            self.user_started = False
+            self.render('failed')
+            return True
+
+        if self.state == 'on':
+            # port tertutup tanpa user menekan tombol: tunnel putus. Unit tunnel
+            # punya Restart=always, jadi tunggu beberapa poll sebelum menyimpulkan.
+            self.down_ticks += 1
+            self.exit_ip = None
+            if self.down_ticks == 1:
+                self.dropped_notified = True
+                notify(f'Tunnel dropped, via {self.via()}. Reconnecting...')
+            elif self.down_ticks >= DROP_PROXY_TICKS and self.clear_proxy_if_ours():
+                notify('Tunnel still down. System proxy turned off.')
+            self.failed = True
+            self.failed_reason = 'drop'
+            self.render('failed')
+            return True
+
+        self.render('failed' if self.failed else 'off')
+        return True
+
+    def proxy_is_ours(self):
+        """True kalau system proxy sekarang menunjuk ke SOCKS kantortun."""
+        socks = Gio.Settings(schema_id='org.gnome.system.proxy.socks')
+        return (self.proxy_settings.get_string('mode') != 'none'
+                and socks.get_string('host') == PROXY_ADDR
+                and socks.get_int('port') == PROXY_PORT)
+
+    def clear_proxy_if_ours(self):
+        """Jangan tinggalkan user offline: proxy yang menunjuk ke tunnel mati
+        membuat semua browsing ikut mati dan terbaca sebagai laptop rusak."""
+        if not self.proxy_is_ours():
+            return False
+        self.proxy_settings.set_string('mode', 'none')
+        return True
+
+    def tooltip(self, state):
+        via = f'{self.via()} ({self.host})' if self.host else self.via()
+        if state == 'on':
+            text = f'Kantortun: connected via {via}'
+            if self.exit_ip:
+                text += f', exit IP {self.exit_ip}'
+            return text
+        if state == 'starting':
+            return f'Kantortun: connecting to {via}'
+        if state == 'failed':
+            if self.failed_reason == 'drop':
+                return 'Kantortun: tunnel dropped, open the log to retry'
+            return f'Kantortun: start failed via {via}, open the log'
+        return f'Kantortun: off, exit {via}'
+
+    def render(self, state):
+        self.state = state
+        live = state == 'on'
+
+        if live:
+            self.toggle_label.set_text(f'Turn off tunnel, via {self.via()}')
+            icon, desc = ICON_ON, 'Tunnel on'
+            self.toggle_item.set_sensitive(True)
+        elif state == 'starting':
+            self.toggle_label.set_text('Starting tunnel...')
+            icon, desc = ICON_OFF, 'Tunnel starting'
+            self.toggle_item.set_sensitive(False)
+        elif state == 'failed':
+            self.toggle_label.set_text(
+                'Tunnel dropped, retry' if self.failed_reason == 'drop'
+                else 'Start failed, try again')
+            icon, desc = ICON_OFF, 'Tunnel not up'
+            self.toggle_item.set_sensitive(True)
+        else:
+            self.toggle_label.set_text('Turn on tunnel')
+            icon, desc = ICON_OFF, 'Tunnel off'
+            self.toggle_item.set_sensitive(True)
+
+        self.indicator.set_icon_full(icon, desc)
+        self.indicator.set_title(self.tooltip(state))
+        self.log_item.set_visible(state == 'failed')
+        # aksi yang cuma masuk akal saat tunnel hidup
+        self.test_item.set_sensitive(live)
+        self.restart_item.set_sensitive(live)
+
+    def render_proxy(self):
+        on = self.proxy_settings.get_string('mode') != 'none'
+        self.proxy_syncing = True
+        self.proxy_item.set_active(on)
+        self.proxy_syncing = False
+
+    def refresh_autostart(self):
+        want = autostart_enabled()
+        if want is None or want == self.autostart_item.get_active():
+            return
+        self.autostart_syncing = True
+        self.autostart_item.set_active(want)
+        self.autostart_syncing = False
+
+    def start_tunnel(self, grace_seconds, notify_text=None):
+        self.failed = False
+        self.failed_reason = ''
+        self.grace_until = GLib.get_monotonic_time() + grace_seconds * 1000000
+        self.user_started = True
+        self.dropped_notified = False
+        if notify_text:
+            notify(notify_text)
+        self.render('starting')
+
+    def fetch_exit_ip(self):
+        """Exit IP nyata lewat SOCKS, sekali per sesi tunnel. Gagal = dibuang."""
+        self.exit_ip_pending = True
+        try:
+            proc = Gio.Subprocess.new(
+                [CURL, '-s', '--max-time', '10', '--socks5-hostname',
+                 f'{PROXY_ADDR}:{PROXY_PORT}', IP_URL],
+                Gio.SubprocessFlags.STDOUT_PIPE)
+        except GLib.Error:
+            self.exit_ip_pending = False
+            return
+        proc.communicate_utf8_async(None, None, self.on_exit_ip)
+
+    def on_exit_ip(self, proc, result, _data=None):
+        self.exit_ip_pending = False
+        try:
+            _, stdout, _ = proc.communicate_utf8_finish(result)
+            text = (stdout or '').strip()
+        except GLib.Error:
+            text = ''
+        # hanya terima bentuk alamat, jangan tampilkan pesan error sebagai IP.
+        self.exit_ip = text if IP_RE.match(text) else None
+        self.render(self.state)
+
+    def on_toggle(self, _item):
+        if self.state == 'on':
+            self.grace_until = 0
+            self.user_started = False
+            self.dropped_notified = False
+            self.failed = False
+            self.failed_reason = ''
+            self.down_ticks = 0
+            self.exit_ip = None
+            subprocess.Popen([SYSTEMCTL, '--user', 'stop', UNIT])
+            cleared = self.clear_proxy_if_ours()
+            notify(f'Tunnel off, via {self.via()}'
+                   + ('. System proxy turned off too.' if cleared else '.'))
+            self.render('off')
+            return
+        subprocess.Popen([SYSTEMCTL, '--user', 'start', UNIT])
+        self.start_tunnel(START_GRACE_SECONDS)
+
+    def on_restart(self, _item):
+        subprocess.Popen([SYSTEMCTL, '--user', 'restart', UNIT])
+        self.start_tunnel(START_GRACE_SECONDS)
+
+    def on_switch_host(self, item, nama):
+        # dipanggil dari 'activate' maupun 'toggled'. Yang menentukan cuma satu:
+        # baris ini memang jadi aktif, dan nama yang sama tidak diproses dobel
+        # dalam 3 detik (activate dan toggled datang bersamaan untuk satu klik).
+        if not item.get_active():
+            return
+        now = GLib.get_monotonic_time()
+        last_name, last_at = self.last_switch
+        if nama == last_name and now - last_at < 3 * 1000000:
+            return
+        self.last_switch = (nama, now)
+        if nama == vps_profile():
+            return
+        # pindah exit server bukan perintah untuk menyambung: kalau tunnelnya
+        # sedang mati, yang berubah cuma tujuannya. CLI yang mengurus itu.
+        if self.state == 'on' or self.grace_until:
+            subprocess.Popen([KANTOR_BIN, 'use', nama])
+            self.start_tunnel(SWITCH_GRACE_SECONDS, notify_text=f'Switching to {nama}')
+        else:
+            subprocess.Popen([KANTOR_BIN, 'use', nama])
+            notify(f'Exit server set to {nama}. Tunnel still off.')
+            GLib.timeout_add(1500, self.poll)
+
+    def on_proxy_toggled(self, item):
+        # lewat CLI, bukan gsettings sendiri: daftar ignore-hosts (rentang privat
+        # dan tailnet) cuma boleh ada di satu tempat, dan versi CLI-nya sudah
+        # benar. Kalau disetel ulang di sini, app dev lokal ikut dikirim ke SOCKS
+        # dan jadi tidak bisa dibuka.
+        if self.proxy_syncing:
+            return
+        if item.get_active():
+            subprocess.Popen([KANTOR_BIN, 'proxy-on'])
+        else:
+            subprocess.Popen([KANTOR_BIN, 'system-off'])
+
+    def on_autostart_toggled(self, item):
+        if self.autostart_syncing:
+            return
+        subprocess.Popen([KANTOR_BIN, 'autostart',
+                          'on' if item.get_active() else 'off'])
+
+    def on_test(self, _item):
+        def done(proc, result, _data=None):
+            code = ''
+            try:
+                _, stdout, _ = proc.communicate_utf8_finish(result)
+                code = (stdout or '').strip()
+            except GLib.Error:
+                code = ''
+            if code and code != '000':
+                notify(f'Tunnel test passed, youtube.com answered {code}')
+            else:
+                notify('Tunnel test failed, youtube.com did not answer')
+
+        try:
+            proc = Gio.Subprocess.new(
+                [CURL, '-s', '-o', '/dev/null', '-w', '%{http_code}', '--max-time', '12',
+                 '--socks5-hostname', f'{PROXY_ADDR}:{PROXY_PORT}', TEST_URL],
+                Gio.SubprocessFlags.STDOUT_PIPE)
+        except GLib.Error:
+            notify('Tunnel test could not run')
+            return
+        proc.communicate_utf8_async(None, None, done)
+
+    def on_copy(self, _item):
+        clipboard = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
+        clipboard.set_text(PROXY_URL, -1)
+        clipboard.store()
+        notify(f'Proxy address copied: {PROXY_URL}')
+
+    def on_open_log(self, _item):
+        try:
+            Gio.AppInfo.launch_default_for_uri(f'file://{LOG_PATH}', None)
+        except GLib.Error:
+            notify(f'Log file: {LOG_PATH}')
+
+    def on_quit(self, _item):
+        # stop unitnya dulu: unit ini Restart=always, jadi keluar dari GTK saja
+        # akan langsung dihidupkan lagi. Kalau dijalankan manual (bukan dari unit),
+        # perintah ini tidak berefek dan prosesnya tetap berhenti lewat Gtk.
+        subprocess.Popen([SYSTEMCTL, '--user', 'stop', INDICATOR_UNIT])
+        Gtk.main_quit()
+
+
+def main():
+    if not os.path.isdir(ICON_DIR):
+        print(f'folder ikon tidak ada: {ICON_DIR}', file=sys.stderr)
+        return 1
+    Kantortun()
+    Gtk.main()
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

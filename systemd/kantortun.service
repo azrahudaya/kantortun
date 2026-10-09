@@ -1,0 +1,16 @@
+[Unit]
+Description=kantortun - SOCKS5 tunnel via VPS (nembus SNI filter kantor)
+Documentation=file:%h/.local/bin/kantortun
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/kantortun-run
+Restart=always
+RestartSec=5
+StandardOutput=append:/tmp/kantortun.log
+StandardError=append:/tmp/kantortun.log
+
+[Install]
+WantedBy=default.target

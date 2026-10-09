@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
+    <g fill="none" stroke="#2e3436" stroke-linecap="round" stroke-width="1.6">
+        <path d="M3 4.5V11.5"/>
+        <path d="M13 4.5V11.5"/>
+        <path d="M3 8h10"/>
+    </g>
+    <circle cx="8" cy="8" r="1.7" fill="#2e3436"/>
+</svg>
+<!-- kantortun nyala: dua mulut pipa yang tersambung garis tembus, plus titik
+     paket di tengah. Motifnya "jalan terus", bukan glyph stok network-vpn,
+     karena alatnya ssh -D bukan VPN. Catatan ini sengaja ditaruh SETELAH tag
+     </svg>: gdk-pixbuf mencocokkan mime dari byte awal saja, dan kalau <svg
+     jatuh di luar ~256 byte pertama ikonnya gagal dimuat lalu panel memakai
+     ikon "gambar hilang". -->

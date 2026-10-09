@@ -1,0 +1,293 @@
+#!/usr/bin/env bash
+# kantortun - nembus filter SNI network kantor pakai VPS sendiri.
+# Blokir kantor itu SNI-based DPI di port 443, jadi DNS/DoH tidak menolong.
+# SSH ke VPS sendiri tembus, jadi semua trafik dibungkus di dalam SSH.
+#
+# Default-nya MATI: unit tunnel tidak di-enable, jadi login ke sesi baru tidak
+# otomatis membungkus trafik. Yang selalu hidup cuma ikon di bar atas, dan
+# on/off-nya dari situ. Default itu diubah lewat `kantortun autostart on|off`.
+set -uo pipefail
+
+CONF="${KANTOR_CONF:-$HOME/.config/kantortun.conf}"
+HOSTS="${KANTOR_HOSTS:-$HOME/.config/kantortun.hosts}"
+[ -r "$CONF" ] && . "$CONF"
+
+VPS_USER="${VPS_USER:-ubuntu}"
+VPS_HOST="${VPS_HOST:-}"
+VPS_KEY="${VPS_KEY:-$HOME/.ssh/id_ed25519}"
+VPS_NAME="${VPS_NAME:-}"
+SOCKS_PORT="${SOCKS_PORT:-1080}"
+HOP="${HOP:-off}"
+HTTP_PORT="${HTTP_PORT:-8118}"
+HTTP_UNIT="kantortun-http"
+
+UNIT="kantortun"
+PROXY="socks5h://127.0.0.1:${SOCKS_PORT}"
+
+# domain uji: yang dulunya diblok kantor
+TEST_LIST="${KANTOR_TEST:-youtube.com x.com facebook.com api.telegram.org notion.so discord.com reddit.com api.openai.com chatgpt.com claude.ai openrouter.ai gemini.google.com}"
+
+c_g=$'\033[32m'; c_r=$'\033[31m'; c_y=$'\033[33m'; c_0=$'\033[0m'
+
+banner() { echo "kantortun - tunnel ${VPS_USER}@${VPS_HOST} (socks5 ${PROXY})"; }
+is_up() { ss -ltn "sport = :${SOCKS_PORT}" 2>/dev/null | grep -q ":${SOCKS_PORT}"; }
+
+# enable/disable unit itu soal "nyala sendiri waktu login", beda dari nyala
+# sekarang. Dipakai juga oleh baris "Start tunnel at login" di ikon bar atas.
+autostart_state() {
+  local s
+  s=$(systemctl --user is-enabled "${UNIT}" 2>/dev/null)
+  [ -n "$s" ] || s=unknown
+  printf '%s' "$s"
+}
+
+cmd_autostart() {
+  case "${1:-status}" in
+    on)
+      if systemctl --user enable "${UNIT}" >/dev/null 2>&1; then
+        echo "${c_g}tunnel akan nyala sendiri waktu login${c_0} (unit ${UNIT} enabled)"
+      else
+        echo "${c_r}gagal enable ${UNIT}${c_0}"; return 1
+      fi ;;
+    off)
+      systemctl --user disable "${UNIT}" >/dev/null 2>&1
+      echo "${c_g}tunnel tidak nyala sendiri waktu login${c_0} (nyala dari ikon di bar atas, atau: kantortun on)" ;;
+    status|"")
+      echo "autostart ${UNIT}: $(autostart_state)"
+      echo "ubah: kantortun autostart on|off" ;;
+    *)
+      echo "pemakaian: kantortun autostart on|off"; return 1 ;;
+  esac
+}
+
+cmd_on() {
+  banner
+  if is_up; then echo "${c_y}tunnel sudah jalan${c_0}"; return 0; fi
+  systemctl --user start "${UNIT}" 2>/dev/null
+  for i in $(seq 1 20); do is_up && break; sleep 1; done
+  if is_up; then echo "${c_g}tunnel ON${c_0}  (proxy: ${PROXY})"; else
+    echo "${c_r}gagal start. cek: systemctl --user status ${UNIT}${c_0}"; tail -5 /tmp/kantortun.log 2>/dev/null; return 1; fi
+}
+
+cmd_off() {
+  systemctl --user stop "${UNIT}" 2>/dev/null
+  # hanya bunuh proses yang benar-benar ssh, jangan pakai pkill -f:
+  # pola -f bisa cocok dengan command line shell pemanggil lalu bunuh diri sendiri.
+  # catatan: /proc/<pid>/cmdline dipisah NUL, jadi "-D 127.0.0.1:1080" tidak pernah
+  # cocok sebagai satu pola. Dua grep terpisah yang benar.
+  for p in $(pgrep -x ssh); do
+    grep -qa -- '-D' "/proc/$p/cmdline" 2>/dev/null &&
+      grep -qa "127.0.0.1:${SOCKS_PORT}" "/proc/$p/cmdline" 2>/dev/null &&
+      kill "$p" 2>/dev/null
+  done
+  sleep 1
+  # penting: jangan tinggalkan proxy sistem nyala kalau tunnel mati,
+  # nanti semua browsing ikut mati dan bingung kenapa internet hilang.
+  gsettings set org.gnome.system.proxy mode 'none' 2>/dev/null
+  is_up && echo "${c_r}masih listen, cek manual${c_0}" || echo "${c_g}tunnel OFF${c_0} (proxy sistem juga dimatikan)"
+}
+
+cmd_status() {
+  banner
+  if is_up; then
+    echo "status   : ${c_g}ON${c_0}"
+    echo "socks    : ${PROXY}"
+    echo "pid ssh  : $(pgrep -x ssh | head -1)"
+    echo "hop      : ${HOP}"
+    echo -n "exit IP  : "
+    curl -s --max-time 12 --socks5-hostname "127.0.0.1:${SOCKS_PORT}" https://ipinfo.io/ip 2>/dev/null || echo "tidak bisa cek"
+    echo ""
+  else
+    echo "status   : ${c_r}OFF${c_0}"
+  fi
+  echo "unit     : $(systemctl --user is-active "${UNIT}" 2>/dev/null)"
+  echo "autostart: $(autostart_state)"
+  if ss -ltn "sport = :${HTTP_PORT}" 2>/dev/null | grep -q ":${HTTP_PORT}"; then
+    echo "proxy CLI: ${c_g}ON${c_0} http://127.0.0.1:${HTTP_PORT}"
+  else
+    echo "proxy CLI: ${c_r}OFF${c_0} http://127.0.0.1:${HTTP_PORT}"
+  fi
+}
+
+cmd_test() {
+  is_up || { echo "${c_r}tunnel belum jalan, jalankan: kantortun on${c_0}"; return 1; }
+  ok=0; bad=0
+  for d in $TEST_LIST; do
+    c=$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 --socks5-hostname "127.0.0.1:${SOCKS_PORT}" "https://$d/" 2>/dev/null)
+    [ -z "$c" ] && c=000
+    if [ "$c" = "000" ]; then printf "  %-24s %sGAGAL%s\n" "$d" "$c_r" "$c_0"; bad=$((bad+1))
+    else printf "  %-24s %sOK%s (%s)\n" "$d" "$c_g" "$c_0" "$c"; ok=$((ok+1)); fi
+  done
+  echo "  -- sukses=$ok gagal=$bad"
+}
+
+# ambil satu baris dari daftar VPS: nama|user|host|key
+profil_cari() {
+  local nama="$1" line
+  [ -r "$HOSTS" ] || return 1
+  line=$(grep -vE '^[[:space:]]*(#|$)' "$HOSTS" | awk -F'|' -v n="$nama" '$1==n {print; exit}')
+  [ -n "$line" ] || return 1
+  printf '%s\n' "$line"
+}
+
+cmd_list() {
+  echo "daftar VPS tujuan (${HOSTS})"
+  if [ -r "$HOSTS" ]; then
+    printf '  %-2s %-10s %-8s %-18s %s\n' "" nama user host key
+    while IFS='|' read -r n u h k; do
+      n="${n//[[:space:]]/}"; u="${u//[[:space:]]/}"; h="${h//[[:space:]]/}"; k="${k//[[:space:]]/}"
+      [ -n "$n" ] || continue
+      [ -n "$k" ] || k="$HOME/.ssh/id_ed25519"
+      if [ "$n" = "$VPS_NAME" ]; then m='*'; else m=' '; fi
+      printf '  %-2s %-10s %-8s %-18s %s\n' "$m" "$n" "$u" "$h" "$k"
+    done < <(grep -vE '^[[:space:]]*(#|$)' "$HOSTS")
+  else
+    echo "  (belum ada file daftar, bikin ${HOSTS})"
+  fi
+  echo ""
+  echo "aktif   : ${VPS_USER}@${VPS_HOST}${VPS_NAME:+ (profil ${VPS_NAME})}"
+  echo "ganti   : kantortun use <nama|host> [key] [hop]"
+}
+
+# pindah VPS tujuan. argumen boleh nama profil dari daftar, boleh host mentah.
+cmd_use() {
+  local arg="${1:-}" key="${2:-}" hop="${3:-off}" nama='' u='' h='' k='' line=''
+  # keadaan sebelum pindah: dipakai untuk memutuskan apakah tunnel disambung
+  # ulang, dan apakah proxy sistem dikembalikan seperti semula.
+  local was_up=0 was_proxy
+  is_up && was_up=1
+  was_proxy=$(gsettings get org.gnome.system.proxy mode 2>/dev/null)
+  if [ -z "$arg" ]; then
+    echo "pemakaian: kantortun use <nama|host> [key] [hop]"
+    echo ""
+    cmd_list
+    return 1
+  fi
+  if line=$(profil_cari "$arg") 2>/dev/null && [ -n "$line" ]; then
+    IFS='|' read -r nama u h k <<<"$line"
+    nama="${nama//[[:space:]]/}"; u="${u//[[:space:]]/}"; h="${h//[[:space:]]/}"; k="${k//[[:space:]]/}"
+    VPS_USER="$u"; VPS_HOST="$h"; key="${k:-$HOME/.ssh/id_ed25519}"
+    echo "${c_g}profil ${nama}${c_0}: ${VPS_USER}@${VPS_HOST}"
+  else
+    VPS_HOST="$arg"
+    key="${key:-$HOME/.ssh/id_ed25519}"
+    echo "${c_y}${arg} bukan nama profil, dianggap host mentah${c_0}"
+  fi
+  mkdir -p "$(dirname "$CONF")"
+  cat > "$CONF" <<EOF
+# dibuat oleh kantortun use
+VPS_NAME=${nama}
+VPS_USER=${VPS_USER}
+VPS_HOST=${VPS_HOST}
+VPS_KEY=${key}
+SOCKS_PORT=${SOCKS_PORT}
+HOP=${hop}
+HOP_KEY=${HOP_KEY:-$HOME/.ssh/id_ed25519}
+EOF
+  echo "${c_g}target diganti ke ${VPS_HOST}${c_0} (key: ${key}, hop: ${hop})"
+  # ganti tujuan bukan perintah untuk menyambung: kalau tadinya hidup, sambung
+  # ulang lewat tujuan baru. Kalau tadinya mati, biarkan mati.
+  cmd_off >/dev/null 2>&1
+  if [ "$was_up" = 1 ]; then
+    cmd_on
+    # cmd_off melepas proxy sistem (biar tidak ada browsing nyangkut ke port
+    # mati). Kalau ternyata user memang memakai proxy sistem, pasang lagi.
+    if [ "$was_proxy" = "'manual'" ]; then cmd_system_on >/dev/null; else cmd_system_off >/dev/null; fi
+  else
+    echo "${c_y}tunnel tetap OFF${c_0}. nyalakan dari ikon di bar atas, atau: kantortun on"
+  fi
+}
+
+cmd_env() {
+  cat <<EOF
+export ALL_PROXY="${PROXY}"
+export HTTP_PROXY="http://127.0.0.1:${HTTP_PORT}"
+export HTTPS_PROXY="http://127.0.0.1:${HTTP_PORT}"
+export NO_PROXY="localhost,127.0.0.1,::1"
+EOF
+}
+
+# proxy HTTP lokal untuk CLI yang cuma paham proxy HTTP (undici/ProxyAgent),
+# misalnya Claude Code dan tool Node lain. Lihat kantortun-httpd.
+cmd_http_status() {
+  local url="http://127.0.0.1:${HTTP_PORT}"
+  echo "proxy HTTP lokal: ${url}"
+  if ss -ltn "sport = :${HTTP_PORT}" 2>/dev/null | grep -q ":${HTTP_PORT}"; then
+    echo "  status : ${c_g}ON${c_0} (unit ${HTTP_UNIT}: $(systemctl --user is-active "${HTTP_UNIT}" 2>/dev/null))"
+    if is_up; then
+      echo "  jalur  : lewat tunnel (SOCKS 127.0.0.1:${SOCKS_PORT})"
+    else
+      echo "  jalur  : ${c_y}langsung${c_0} (tunnel mati, jadi tetap jalan di jaringan normal)"
+    fi
+  else
+    echo "  status : ${c_r}OFF${c_0}. hidupkan: systemctl --user start ${HTTP_UNIT}"
+  fi
+  echo "  pakai di CLI: export HTTPS_PROXY=${url} HTTP_PROXY=${url} NO_PROXY=localhost,127.0.0.1,::1"
+}
+
+cmd_system_on() {
+  cmd_on || return 1
+  cmd_proxy_on
+}
+
+# setel proxy sistem saja, tanpa menyentuh tunnel. Dipakai oleh cmd_system_on dan
+# oleh baris "System proxy" di ikon bar atas, supaya daftar ignore-hosts cuma ada
+# di satu tempat.
+cmd_proxy_on() {
+  gsettings set org.gnome.system.proxy mode 'manual'
+  gsettings set org.gnome.system.proxy.socks host '127.0.0.1'
+  gsettings set org.gnome.system.proxy.socks port "${SOCKS_PORT}"
+  # ignore-hosts harus mencakup rentang privat + CGNAT Tailscale. Kalau tidak,
+  # Chrome ikut mengirim docker (172.16/12), LAN kantor (10/8), dan tailnet
+  # (100.64/10) ke SOCKS di VPS, dan app dev lokal jadi tidak bisa dibuka.
+  gsettings set org.gnome.system.proxy ignore-hosts "['localhost','127.0.0.0/8','::1','*.local','10.0.0.0/8','172.16.0.0/12','192.168.0.0/16','100.64.0.0/10','169.254.0.0/16']"
+  echo "${c_g}proxy sistem GNOME ON${c_0}"
+}
+
+cmd_system_off() {
+  gsettings set org.gnome.system.proxy mode 'none'
+  echo "${c_g}proxy sistem GNOME OFF${c_0}"
+}
+
+case "${1:-status}" in
+  on|start)     cmd_on ;;
+  off|stop)     cmd_off ;;
+  status|st)    cmd_status ;;
+  test|cek)     cmd_test ;;
+  env)          cmd_env ;;
+  restart)      cmd_off; cmd_on ;;
+  use)          shift; cmd_use "$@" ;;
+  list|ls|vps)  cmd_list ;;
+  http|http-status) cmd_http_status ;;
+  autostart|auto) shift; cmd_autostart "$@" ;;
+  system-on)    cmd_system_on ;;
+  system-off)   cmd_system_off ;;
+  proxy-on)     cmd_proxy_on ;;
+  *) cat <<EOF
+$(banner)
+
+pemakaian: kantortun <perintah>
+
+  on            nyalakan tunnel
+  off           matikan tunnel (proxy sistem ikut direset)
+  status        lihat status, jalur, dan IP keluar
+  test          uji domain yang dulunya diblok
+  env           cetak env var proxy (eval \$(kantortun env))
+  restart       restart tunnel
+  list          lihat daftar VPS tujuan + mana yang aktif
+  http          status proxy HTTP lokal untuk CLI yang tidak baca proxy sistem
+  autostart on|off
+                atur apakah tunnel nyala sendiri waktu login. default: off
+  use <nama|host> [key] [hop]
+                ganti VPS tujuan. nama diambil dari daftar, host mentah juga bisa.
+                hop=off untuk jalur lurus
+  system-on     tunnel + set proxy sistem GNOME
+  system-off    matikan proxy sistem GNOME
+
+  paling gampang: on/off dari ikon kantortun di bar atas (selalu ada di situ),
+  di situ juga ada System proxy, pilih VPS tujuan, test, dan log.
+
+  tip: curl --socks5-hostname 127.0.0.1:${SOCKS_PORT} https://situs.com
+EOF
+    ;;
+esac

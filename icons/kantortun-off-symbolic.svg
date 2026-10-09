@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
+    <g fill="none" stroke="#2e3436" stroke-linecap="round" stroke-width="1.6">
+        <path d="M3 4.5V11.5"/>
+        <path d="M13 4.5V11.5"/>
+        <path d="M3 8h2.4"/>
+        <path d="M10.6 8H13"/>
+    </g>
+</svg>
+<!-- kantortun mati: grendel yang sama, tapi garis tembusnya putus di tengah dan
+     titik paketnya hilang. Bedanya bentuk, bukan cuma warna, jadi tetap terbaca
+     monokrom. Catatan ditaruh setelah </svg>, lihat kantortun-on-symbolic.svg. -->

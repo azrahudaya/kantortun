@@ -1,0 +1,14 @@
+# Konfigurasi privat & kredensial
+*.conf
+*.hosts
+id_*
+*.pem
+*.key
+
+# Log & cache
+*.log
+__pycache__/
+*.py[cod]
+
+# System artifacts
+.DS_Store

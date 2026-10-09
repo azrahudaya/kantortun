@@ -1,0 +1,5 @@
+# Daftar VPS tujuan tunnel kantor
+# format: nama|user ssh|host|key
+# Dipakai oleh: kantortun use <nama>, dan menu Exit server di tray indicator
+main|ubuntu|203.0.113.10|~/.ssh/id_ed25519
+backup|root|198.51.100.20|~/.ssh/id_ed25519

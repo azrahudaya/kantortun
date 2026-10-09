@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Kantortun Indicator
+Comment=Indikator top bar untuk tunnel kantor (selalu hidup)
+# Autostart ini cuma menarik unit systemd-nya. Kalau prosesnya mati, systemd yang
+# menghidupkan lagi, bukan sesi GNOME.
+Exec=/usr/bin/systemctl --user start kantortun-indicator.service
+Icon=/home/fuudaya/.local/share/kantortun/kantortun-on-symbolic.svg
+Terminal=false
+NoDisplay=true
+X-GNOME-Autostart-enabled=true

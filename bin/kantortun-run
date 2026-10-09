@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# Launcher tunnel. Dijalankan oleh systemd (kantortun.service).
+# Semua pengaturan ada di ~/.config/kantortun.conf
+set -u
+
+CONF="${KANTOR_CONF:-$HOME/.config/kantortun.conf}"
+[ -r "$CONF" ] && . "$CONF"
+
+VPS_USER="${VPS_USER:-ubuntu}"
+VPS_HOST="${VPS_HOST:?VPS_HOST belum diisi di $CONF}"
+VPS_KEY="${VPS_KEY:-$HOME/.ssh/id_ed25519}"
+SOCKS_PORT="${SOCKS_PORT:-1080}"
+HOP="${HOP:-off}"
+ROUTE="$HOME/.local/bin/kantortun-route"
+
+COMMON=(
+  -N -D "127.0.0.1:${SOCKS_PORT}"
+  -o ExitOnForwardFailure=yes
+  -o ServerAliveInterval=15
+  -o ServerAliveCountMax=3
+  -o TCPKeepAlive=yes
+  -o StrictHostKeyChecking=accept-new
+  -o BatchMode=yes
+  -o IdentitiesOnly=yes
+  -o PreferredAuthentications=publickey
+  -o NumberOfPasswordPrompts=0
+)
+
+if [[ "$HOP" == "off" || -z "$HOP" ]]; then
+  exec /usr/bin/ssh "${COMMON[@]}" -i "$VPS_KEY" "${VPS_USER}@${VPS_HOST}"
+fi
+
+if timeout 5 bash -c "cat </dev/null >/dev/tcp/${VPS_HOST}/22" 2>/dev/null; then
+  exec /usr/bin/ssh "${COMMON[@]}" -i "$VPS_KEY" "${VPS_USER}@${VPS_HOST}"
+fi
+
+echo "kantortun-run: ${VPS_HOST}:22 diblokir langsung, pakai jalur lompatan ${HOP}" >&2
+exec /usr/bin/ssh "${COMMON[@]}" \
+  -o "ProxyCommand=${ROUTE} %h %p" \
+  -i "$VPS_KEY" "${VPS_USER}@${VPS_HOST}"

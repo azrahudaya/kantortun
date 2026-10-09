@@ -1,0 +1,9 @@
+# Contoh konfigurasi kantortun
+# Salin ke ~/.config/kantortun.conf
+VPS_NAME=main
+VPS_USER=ubuntu
+VPS_HOST=203.0.113.10
+VPS_KEY=~/.ssh/id_ed25519
+SOCKS_PORT=1080
+HOP=off
+HOP_KEY=~/.ssh/id_ed25519

@@ -1,0 +1,179 @@
+#!/usr/bin/env python3
+# Proxy HTTP CONNECT lokal untuk tool CLI yang cuma paham proxy HTTP.
+#
+# Kenapa ada: Claude Code (dan tool Node lain) memakai undici ProxyAgent, yang
+# hanya mengerti proxy HTTP CONNECT. Tunnel kantortun memakai ssh -D, yaitu
+# SOCKS5. Kalau HTTPS_PROXY diisi socks5h://..., Claude Code berhenti dengan
+# "Proxy connection ended before receiving CONNECT response".
+#
+# Cara kerja: terima CONNECT host:port, lalu teruskan ke SOCKS5 kantortun kalau
+# tunnelnya hidup, dan sambung langsung kalau tunnelnya mati. Jadi saat di rumah
+# (tunnel off) tool yang memakai proxy ini tetap jalan lewat jalur langsung.
+# DNS selalu diselesaikan di sisi proxy saat lewat SOCKS, jadi tidak bocor dan
+# tidak kena masalah IPv6-only dari resolver kantor.
+#
+# Listen di 127.0.0.1 saja, tanpa auth, jadi jangan diubah ke 0.0.0.0.
+# Pemakaian: kantortun-httpd [port]  (default 8118)
+
+import socket
+import sys
+import threading
+
+LISTEN_ADDR = '127.0.0.1'
+LISTEN_PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 8118
+SOCKS_ADDR = '127.0.0.1'
+SOCKS_PORT = 1080
+SOCKS_PROBE_TIMEOUT = 0.4
+CONNECT_TIMEOUT = 15
+IDLE_TIMEOUT = 120
+BUF = 65536
+
+
+def log(msg):
+    print(msg, file=sys.stderr, flush=True)
+
+
+def socks_open():
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(SOCKS_PROBE_TIMEOUT)
+    try:
+        s.connect((SOCKS_ADDR, SOCKS_PORT))
+        return True
+    except OSError:
+        return False
+    finally:
+        s.close()
+
+
+def recv_exact(sock, n):
+    data = b''
+    while len(data) < n:
+        chunk = sock.recv(n - len(data))
+        if not chunk:
+            raise OSError('koneksi putus saat handshake')
+        data += chunk
+    return data
+
+
+def connect_via_socks(host, port):
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(CONNECT_TIMEOUT)
+    s.connect((SOCKS_ADDR, SOCKS_PORT))
+    s.sendall(b'\x05\x01\x00')
+    if recv_exact(s, 2) != b'\x05\x00':
+        raise OSError('SOCKS5 menolak metode tanpa auth')
+    # ATYP 3 = nama host, biar DNS diselesaikan di sisi VPS
+    req = b'\x05\x01\x00\x03' + bytes([len(host)]) + host.encode() + port.to_bytes(2, 'big')
+    s.sendall(req)
+    head = recv_exact(s, 4)
+    if head[1] != 0:
+        raise OSError('SOCKS5 gagal connect, kode %d' % head[1])
+    if head[3] == 1:
+        recv_exact(s, 6)
+    elif head[3] == 3:
+        recv_exact(s, recv_exact(s, 1)[0] + 2)
+    elif head[3] == 4:
+        recv_exact(s, 18)
+    s.settimeout(None)
+    return s
+
+
+def connect_direct(host, port):
+    s = socket.create_connection((host, port), timeout=CONNECT_TIMEOUT)
+    s.settimeout(None)
+    return s
+
+
+def relay(src, dst):
+    try:
+        while True:
+            data = src.recv(BUF)
+            if not data:
+                break
+            dst.sendall(data)
+    except OSError:
+        pass
+    finally:
+        for s in (src, dst):
+            try:
+                s.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
+
+def handle(client, addr):
+    upstream = None
+    try:
+        client.settimeout(IDLE_TIMEOUT)
+        buf = b''
+        while b'\r\n\r\n' not in buf:
+            chunk = client.recv(BUF)
+            if not chunk:
+                return
+            buf += chunk
+            if len(buf) > 65536:
+                return
+        head, _, rest = buf.partition(b'\r\n\r\n')
+        lines = head.split(b'\r\n')
+        parts = lines[0].split()
+        if len(parts) < 2 or parts[0].upper() != b'CONNECT':
+            client.sendall(b'HTTP/1.1 501 Not Implemented\r\n'
+                           b'Proxy ini hanya untuk CONNECT (HTTPS).\r\n\r\n')
+            return
+        target = parts[1].decode()
+        host, _, port = target.rpartition(':')
+        if not host:
+            host, port = target, '443'
+        port = int(port)
+
+        via = 'socks'
+        try:
+            if socks_open():
+                upstream = connect_via_socks(host, port)
+            else:
+                raise OSError('tunnel mati')
+        except OSError:
+            via = 'direct'
+            upstream = connect_direct(host, port)
+
+        client.sendall(b'HTTP/1.1 200 Connection Established\r\n\r\n')
+        if rest:
+            upstream.sendall(rest)
+        client.settimeout(None)
+        log('%s %s:%d (%s)' % (addr[0], host, port, via))
+
+        t = threading.Thread(target=relay, args=(client, upstream), daemon=True)
+        t.start()
+        relay(upstream, client)
+    except Exception as exc:  # noqa: BLE001 - proxy harus tetap hidup
+        log('gagal %s: %s' % (addr[0], exc))
+    finally:
+        for s in (client, upstream):
+            if s is not None:
+                try:
+                    s.close()
+                except OSError:
+                    pass
+
+
+def main():
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind((LISTEN_ADDR, LISTEN_PORT))
+    srv.listen(64)
+    log('kantortun-httpd listen di %s:%d (SOCKS %s:%d, fallback langsung)'
+        % (LISTEN_ADDR, LISTEN_PORT, SOCKS_ADDR, SOCKS_PORT))
+    while True:
+        try:
+            client, addr = srv.accept()
+        except OSError as exc:
+            log('accept gagal: %s' % exc)
+            continue
+        threading.Thread(target=handle, args=(client, addr), daemon=True).start()
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit(0)

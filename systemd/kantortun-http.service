@@ -1,0 +1,13 @@
+[Unit]
+Description=Proxy HTTP CONNECT untuk CLI (dibelokkan ke tunnel kantor kalau hidup)
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/kantortun-httpd
+Restart=always
+RestartSec=5
+StandardOutput=append:/tmp/kantortun-http.log
+StandardError=append:/tmp/kantortun-http.log
+
+[Install]
+WantedBy=default.target
