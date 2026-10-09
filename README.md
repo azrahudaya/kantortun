@@ -1,30 +1,49 @@
 # kantortun
 
-Bypass filter SNI dan DPI jaringan kantor menggunakan VPS pribadi via SSH dynamic SOCKS5 dan local HTTP CONNECT bridge.
+![Python](https://img.shields.io/badge/Python-3.10+-3776AB?style=flat&logo=python&logoColor=white)
+![Bash](https://img.shields.io/badge/Bash-4.0+-4EAA25?style=flat&logo=gnubash&logoColor=white)
+![systemd](https://img.shields.io/badge/systemd-user%20service-555555?style=flat&logo=systemd&logoColor=white)
+![SSH](https://img.shields.io/badge/SSH-OpenSSH-231F20?style=flat)
+![GNOME](https://img.shields.io/badge/GNOME-AppIndicator-4a86cf?style=flat&logo=gnome&logoColor=white)
+![Linux](https://img.shields.io/badge/OS-Linux-FCC624?style=flat&logo=linux&logoColor=black)
 
-## Latar Belakang
+Lightweight SSH dynamic SOCKS5 tunnel and local HTTP CONNECT bridge designed to bypass restrictive SNI and DPI network filters.
 
-Filter jaringan kantor umumnya menerapkan SNI-based Deep Packet Inspection (DPI) pada port TCP 443. Ketika TLS ClientHello membawa SNI domain yang diblokir, koneksi langsung di-reset, sehingga penggantian DNS / DoH / DoT tidak berpengaruh.
+## Architecture
 
-Jalur yang tembus:
-- Port 22 (SSH) ke VPS pribadi
-- TCP port 80/443 langsung ke VPS pribadi
+```text
++---------------------------------------------------------------+
+| Local Machine                                                 |
+|                                                               |
+|   Browser / Git / curl ----->  SOCKS5 (127.0.0.1:1080) -----+ |
+|                                                             | |
+|   Claude Code / Node   ----->  HTTP CONNECT (127.0.0.1:8118)| |
+|                                          |                  | |
+|                                          v                  | |
+|                            SOCKS5 (127.0.0.1:1080) <--------+ |
+|                                          |                    |
+|                                          v                    |
+|                            kantortun-run (ssh -N -D)          |
++------------------------------------------|--------------------+
+                                           |
+                               SSH Port 22 | (Encrypted Tunnel)
+                                           v
+                       +---------------------------------------+
+                       | Remote VPS                            |
+                       |                                       |
+                       | Clean Outbound Internet               |
+                       +---------------------------------------+
+```
 
-kantortun membungkus seluruh trafik keluar ke dalam SSH tunnel terenkripsi sehingga DPI kantor hanya melihat sesi SSH biasa.
+## Features
 
-## Arsitektur
+- Dynamic SOCKS5 proxy via user-level SSH tunnel with fast failover keepalive.
+- Dedicated local HTTP CONNECT bridge (port 8118) supporting HTTPS tunneling and plain HTTP forwarding for Node.js, undici, and Claude Code.
+- TCP half-close support to keep streaming responses and long LLM reasoning sessions alive.
+- GNOME top bar indicator for quick toggling, exit IP inspection, and profile switching.
+- Zero root dependencies, running entirely under systemd user services.
 
-1. **kantortun.service (`kantortun-run`)**
-   Unit systemd user yang menjalankan `ssh -N -D 127.0.0.1:1080` ke VPS dengan keepalive dan auto-restart.
-
-2. **kantortun-http.service (`kantortun-httpd`)**
-   Daemon bridge HTTP CONNECT di port 8118 (`http://127.0.0.1:8118`) yang meneruskan koneksi HTTPS ke SOCKS5 1080.
-   Diperlukan karena CLI berbasis Node.js / undici (seperti Claude Code) hanya memahami HTTP CONNECT proxy dan menolak SOCKS5 di `HTTPS_PROXY`.
-
-3. **kantortun-indicator.service (`kantortun-indicator`)**
-   Tray icon di top bar desktop GNOME untuk menyalakan/mematikan tunnel, sinkronisasi system proxy GNOME, melihat status IP keluar, dan berpindah VPS exit.
-
-## Instalasi
+## Installation
 
 ```bash
 git clone git@github.com:azrahudaya/kantortun.git ~/Projects/kantortun
@@ -32,30 +51,31 @@ cd ~/Projects/kantortun
 ./install.sh
 ```
 
-Salin dan sesuaikan konfigurasi VPS:
+Configure your remote VPS endpoints:
+
 ```bash
 cp config/kantortun.conf.example ~/.config/kantortun.conf
 cp config/kantortun.hosts.example ~/.config/kantortun.hosts
 nano ~/.config/kantortun.conf
 ```
 
-## Penggunaan CLI
+## CLI Usage
 
 ```bash
-kantortun on            # Nyalakan tunnel
-kantortun off           # Matikan tunnel dan reset proxy sistem
-kantortun status        # Cek status koneksi, PID SSH, dan IP keluar
-kantortun test          # Uji akses domain yang diblokir
-kantortun env           # Cetak environment variable proxy
-kantortun system-on     # Nyalakan tunnel dan pasang proxy GNOME (Chrome/Firefox otomatis ikut)
-kantortun system-off    # Matikan proxy GNOME
-kantortun autostart on  # Jalankan tunnel otomatis saat login
-kantortun use <nama>    # Pindah VPS tujuan dari daftar ~/.config/kantortun.hosts
+kantortun on            # Start SSH tunnel
+kantortun off           # Stop tunnel and reset system proxy
+kantortun status        # Check connection status, PID, and exit IP
+kantortun test          # Test target domains and Claude Code HTTP bridge
+kantortun env           # Output environment variables for shell export
+kantortun system-on     # Turn on tunnel and set GNOME system proxy
+kantortun system-off    # Disable GNOME system proxy
+kantortun autostart on  # Enable tunnel on user login
+kantortun use <profile> # Switch active VPS from ~/.config/kantortun.hosts
 ```
 
-## Konfigurasi untuk Claude Code
+## Claude Code Setup
 
-Claude Code menggunakan `undici` yang memerlukan HTTP CONNECT proxy. Setel proxy di `~/.claude/settings.json`:
+Claude Code uses `undici`, which requires an HTTP CONNECT proxy rather than SOCKS5. Set the proxy in `~/.claude/settings.json`:
 
 ```json
 {
@@ -67,29 +87,30 @@ Claude Code menggunakan `undici` yang memerlukan HTTP CONNECT proxy. Setel proxy
 }
 ```
 
-Pastikan service `kantortun-http.service` aktif:
+Ensure the HTTP bridge service is running:
+
 ```bash
 systemctl --user enable --now kantortun-http.service
 ```
 
-## Konfigurasi Aplikasi Lain
+## Other Applications
 
-CLI / Terminal umum:
+Shell session:
+
 ```bash
 eval $(kantortun env)
 ```
 
 Git:
+
 ```bash
 git config --global http.proxy http://127.0.0.1:8118
 ```
-atau via SOCKS:
-```bash
-git config --global http.proxy socks5h://127.0.0.1:1080
-```
 
-Browser:
-Cukup aktifkan fitur "System proxy" dari tray icon atau jalankan:
+Web Browsers:
+
+Click "System proxy" in the top bar tray icon or run:
+
 ```bash
 kantortun system-on
 ```
