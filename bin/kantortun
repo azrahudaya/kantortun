@@ -118,7 +118,16 @@ cmd_test() {
     if [ "$c" = "000" ]; then printf "  %-24s %sGAGAL%s\n" "$d" "$c_r" "$c_0"; bad=$((bad+1))
     else printf "  %-24s %sOK%s (%s)\n" "$d" "$c_g" "$c_0" "$c"; ok=$((ok+1)); fi
   done
-  echo "  -- sukses=$ok gagal=$bad"
+  echo "  -- SOCKS5 sukses=$ok gagal=$bad"
+  echo ""
+  echo "uji bridge HTTP CLI (port ${HTTP_PORT} untuk Claude Code):"
+  hc=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 -x "http://127.0.0.1:${HTTP_PORT}" "https://api.anthropic.com/" 2>/dev/null)
+  [ -z "$hc" ] && hc=000
+  if [ "$hc" != "000" ]; then
+    printf "  %-24s %sOK%s (%s)\n" "api.anthropic.com" "$c_g" "$c_0" "$hc"
+  else
+    printf "  %-24s %sGAGAL%s\n" "api.anthropic.com" "$c_r" "$c_0"
+  fi
 }
 
 # ambil satu baris dari daftar VPS: nama|user|host|key
