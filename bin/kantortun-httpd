@@ -1,31 +1,23 @@
 #!/usr/bin/env python3
-# Proxy HTTP CONNECT lokal untuk tool CLI yang cuma paham proxy HTTP.
+# kantortun-httpd - Proxy HTTP & CONNECT lokal untuk tool CLI
 #
-# Kenapa ada: Claude Code (dan tool Node lain) memakai undici ProxyAgent, yang
-# hanya mengerti proxy HTTP CONNECT. Tunnel kantortun memakai ssh -D, yaitu
-# SOCKS5. Kalau HTTPS_PROXY diisi socks5h://..., Claude Code berhenti dengan
-# "Proxy connection ended before receiving CONNECT response".
-#
-# Cara kerja: terima CONNECT host:port, lalu teruskan ke SOCKS5 kantortun kalau
-# tunnelnya hidup, dan sambung langsung kalau tunnelnya mati. Jadi saat di rumah
-# (tunnel off) tool yang memakai proxy ini tetap jalan lewat jalur langsung.
-# DNS selalu diselesaikan di sisi proxy saat lewat SOCKS, jadi tidak bocor dan
-# tidak kena masalah IPv6-only dari resolver kantor.
-#
-# Listen di 127.0.0.1 saja, tanpa auth, jadi jangan diubah ke 0.0.0.0.
-# Pemakaian: kantortun-httpd [port]  (default 8118)
+# Mendukung:
+# 1. HTTP CONNECT (HTTPS, WebSocket, SSE/streaming) - untuk Claude Code, Node undici, curl, dll.
+# 2. Plain HTTP forwarding (GET/POST http://...) - untuk CLI/package manager yang memakai HTTP_PROXY.
+# 3. Meneruskan koneksi ke SOCKS5 kantortun (127.0.0.1:1080) jika aktif, dan fallback direct jika mati.
+# 4. Penanganan TCP half-close (SHUT_WR) agar streaming, upload payload besar, dan thinking mode tidak terputus.
 
 import socket
 import sys
 import threading
+from urllib.parse import urlsplit
 
 LISTEN_ADDR = '127.0.0.1'
 LISTEN_PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 8118
 SOCKS_ADDR = '127.0.0.1'
 SOCKS_PORT = 1080
-SOCKS_PROBE_TIMEOUT = 0.4
-CONNECT_TIMEOUT = 15
-IDLE_TIMEOUT = 120
+CONNECT_TIMEOUT = 12
+HEADER_TIMEOUT = 30
 BUF = 65536
 
 
@@ -33,41 +25,33 @@ def log(msg):
     print(msg, file=sys.stderr, flush=True)
 
 
-def socks_open():
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.settimeout(SOCKS_PROBE_TIMEOUT)
-    try:
-        s.connect((SOCKS_ADDR, SOCKS_PORT))
-        return True
-    except OSError:
-        return False
-    finally:
-        s.close()
-
-
 def recv_exact(sock, n):
     data = b''
     while len(data) < n:
         chunk = sock.recv(n - len(data))
         if not chunk:
-            raise OSError('koneksi putus saat handshake')
+            raise OSError('koneksi putus saat handshake SOCKS5')
         data += chunk
     return data
 
 
 def connect_via_socks(host, port):
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
     s.settimeout(CONNECT_TIMEOUT)
     s.connect((SOCKS_ADDR, SOCKS_PORT))
     s.sendall(b'\x05\x01\x00')
     if recv_exact(s, 2) != b'\x05\x00':
+        s.close()
         raise OSError('SOCKS5 menolak metode tanpa auth')
-    # ATYP 3 = nama host, biar DNS diselesaikan di sisi VPS
-    req = b'\x05\x01\x00\x03' + bytes([len(host)]) + host.encode() + port.to_bytes(2, 'big')
+    # ATYP 3 = domain name (DNS resolved di VPS)
+    encoded_host = host.encode('idna')
+    req = b'\x05\x01\x00\x03' + bytes([len(encoded_host)]) + encoded_host + port.to_bytes(2, 'big')
     s.sendall(req)
     head = recv_exact(s, 4)
     if head[1] != 0:
-        raise OSError('SOCKS5 gagal connect, kode %d' % head[1])
+        s.close()
+        raise OSError('SOCKS5 gagal connect, status %d' % head[1])
     if head[3] == 1:
         recv_exact(s, 6)
     elif head[3] == 3:
@@ -80,11 +64,22 @@ def connect_via_socks(host, port):
 
 def connect_direct(host, port):
     s = socket.create_connection((host, port), timeout=CONNECT_TIMEOUT)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
     s.settimeout(None)
     return s
 
 
-def relay(src, dst):
+def get_upstream(host, port):
+    via = 'socks'
+    try:
+        upstream = connect_via_socks(host, port)
+    except OSError:
+        via = 'direct'
+        upstream = connect_direct(host, port)
+    return upstream, via
+
+
+def pipe(src, dst):
     try:
         while True:
             data = src.recv(BUF)
@@ -94,17 +89,17 @@ def relay(src, dst):
     except OSError:
         pass
     finally:
-        for s in (src, dst):
-            try:
-                s.shutdown(socket.SHUT_RDWR)
-            except OSError:
-                pass
+        try:
+            dst.shutdown(socket.SHUT_WR)
+        except OSError:
+            pass
 
 
 def handle(client, addr):
     upstream = None
     try:
-        client.settimeout(IDLE_TIMEOUT)
+        client.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        client.settimeout(HEADER_TIMEOUT)
         buf = b''
         while b'\r\n\r\n' not in buf:
             chunk = client.recv(BUF)
@@ -112,40 +107,89 @@ def handle(client, addr):
                 return
             buf += chunk
             if len(buf) > 65536:
+                client.sendall(b'HTTP/1.1 431 Request Header Fields Too Large\r\n\r\n')
                 return
         head, _, rest = buf.partition(b'\r\n\r\n')
         lines = head.split(b'\r\n')
-        parts = lines[0].split()
-        if len(parts) < 2 or parts[0].upper() != b'CONNECT':
-            client.sendall(b'HTTP/1.1 501 Not Implemented\r\n'
-                           b'Proxy ini hanya untuk CONNECT (HTTPS).\r\n\r\n')
+        if not lines or not lines[0]:
             return
-        target = parts[1].decode()
-        host, _, port = target.rpartition(':')
-        if not host:
-            host, port = target, '443'
-        port = int(port)
+        parts = lines[0].split()
+        if len(parts) < 2:
+            return
 
-        via = 'socks'
-        try:
-            if socks_open():
-                upstream = connect_via_socks(host, port)
+        method = parts[0].decode('latin1', 'replace').upper()
+        raw_target = parts[1].decode('latin1', 'replace')
+
+        if method == 'CONNECT':
+            host, _, port_str = raw_target.rpartition(':')
+            if not host:
+                host = raw_target
+                port = 443
             else:
-                raise OSError('tunnel mati')
-        except OSError:
-            via = 'direct'
-            upstream = connect_direct(host, port)
+                port = int(port_str) if port_str.isdigit() else 443
 
-        client.sendall(b'HTTP/1.1 200 Connection Established\r\n\r\n')
-        if rest:
-            upstream.sendall(rest)
-        client.settimeout(None)
-        log('%s %s:%d (%s)' % (addr[0], host, port, via))
+            try:
+                upstream, via = get_upstream(host, port)
+            except OSError as exc:
+                log('%s CONNECT %s:%d gagal: %s' % (addr[0], host, port, exc))
+                client.sendall(b'HTTP/1.1 502 Bad Gateway\r\n'
+                               b'Content-Type: text/plain; charset=utf-8\r\n'
+                               b'Connection: close\r\n\r\n'
+                               b'kantortun: gagal menyambung ke tujuan.\r\n')
+                return
 
-        t = threading.Thread(target=relay, args=(client, upstream), daemon=True)
+            client.sendall(b'HTTP/1.1 200 Connection Established\r\n\r\n')
+            if rest:
+                upstream.sendall(rest)
+            client.settimeout(None)
+            log('%s CONNECT %s:%d (%s)' % (addr[0], host, port, via))
+
+        else:
+            # Plain HTTP request (GET, POST, dll.)
+            parsed = urlsplit(raw_target)
+            host = parsed.hostname
+            if not host:
+                for line in lines[1:]:
+                    if line.lower().startswith(b'host:'):
+                        host = line.split(b':', 1)[1].strip().decode('latin1', 'replace')
+                        if ':' in host:
+                            host, _, p = host.rpartition(':')
+                            port = int(p) if p.isdigit() else 80
+                        else:
+                            port = 80
+                        break
+                if not host:
+                    client.sendall(b'HTTP/1.1 400 Bad Request\r\n\r\n')
+                    return
+            else:
+                port = parsed.port or 80
+
+            path = (parsed.path or '/') + (('?' + parsed.query) if parsed.query else '')
+            http_version = parts[2] if len(parts) > 2 else b'HTTP/1.1'
+            new_first_line = f'{method} {path} '.encode('latin1') + http_version
+            new_head = b'\r\n'.join([new_first_line] + lines[1:]) + b'\r\n\r\n'
+
+            try:
+                upstream, via = get_upstream(host, port)
+            except OSError as exc:
+                log('%s %s %s:%d gagal: %s' % (addr[0], method, host, port, exc))
+                client.sendall(b'HTTP/1.1 502 Bad Gateway\r\n'
+                               b'Content-Type: text/plain; charset=utf-8\r\n'
+                               b'Connection: close\r\n\r\n'
+                               b'kantortun: gagal menyambung ke tujuan.\r\n')
+                return
+
+            upstream.sendall(new_head)
+            if rest:
+                upstream.sendall(rest)
+            client.settimeout(None)
+            log('%s %s %s:%d (%s)' % (addr[0], method, host, port, via))
+
+        t = threading.Thread(target=pipe, args=(client, upstream), daemon=True)
         t.start()
-        relay(upstream, client)
-    except Exception as exc:  # noqa: BLE001 - proxy harus tetap hidup
+        pipe(upstream, client)
+
+    except Exception as exc:  # noqa: BLE001
         log('gagal %s: %s' % (addr[0], exc))
     finally:
         for s in (client, upstream):
