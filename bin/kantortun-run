@@ -16,9 +16,11 @@ ROUTE="$HOME/.local/bin/kantortun-route"
 COMMON=(
   -N -D "127.0.0.1:${SOCKS_PORT}"
   -o ExitOnForwardFailure=yes
-  -o ServerAliveInterval=15
+  -o ServerAliveInterval=10
   -o ServerAliveCountMax=3
   -o TCPKeepAlive=yes
+  -o Compression=no
+  -o IPQoS=none
   -o StrictHostKeyChecking=accept-new
   -o BatchMode=yes
   -o IdentitiesOnly=yes
