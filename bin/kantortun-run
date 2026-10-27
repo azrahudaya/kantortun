@@ -20,6 +20,7 @@ COMMON=(
   -o ServerAliveCountMax=3
   -o TCPKeepAlive=yes
   -o Compression=no
+  -c aes128-gcm@openssh.com
   -o IPQoS=none
   -o StrictHostKeyChecking=accept-new
   -o BatchMode=yes
